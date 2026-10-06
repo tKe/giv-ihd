@@ -1,0 +1,21 @@
+# Generated from fonts/materialdesignicons.css - regenerate if the MDI font is updated.
+# Include as a package - see tools/mdi_codepoints.py.
+substitutions:
+  mdi_weather_sunny: "\U000F0599"  # mdi-weather-sunny U+F0599
+  mdi_power_plug: "\U000F06A5"  # mdi-power-plug U+F06A5
+  mdi_transmission_tower: "\U000F0D3E"  # mdi-transmission-tower U+F0D3E
+  mdi_home_outline: "\U000F06A1"  # mdi-home-outline U+F06A1
+  mdi_battery_outline: "\U000F008E"  # mdi-battery-outline U+F008E
+  mdi_battery_low: "\U000F12A1"  # mdi-battery-low U+F12A1
+  mdi_battery_medium: "\U000F12A2"  # mdi-battery-medium U+F12A2
+  mdi_battery_high: "\U000F12A3"  # mdi-battery-high U+F12A3
+  mdi_battery: "\U000F0079"  # mdi-battery U+F0079
+  mdi_arrow_top_left: "\U000F005B"  # mdi-arrow-top-left U+F005B
+  mdi_arrow_top_right: "\U000F005C"  # mdi-arrow-top-right U+F005C
+  mdi_arrow_bottom_left: "\U000F0042"  # mdi-arrow-bottom-left U+F0042
+  mdi_arrow_bottom_right: "\U000F0043"  # mdi-arrow-bottom-right U+F0043
+  mdi_transmission_tower_import: "\U000F192D"  # mdi-transmission-tower-import U+F192D
+  mdi_transmission_tower_export: "\U000F192C"  # mdi-transmission-tower-export U+F192C
+  mdi_wifi: "\U000F05A9"  # mdi-wifi U+F05A9
+  mdi_thermometer: "\U000F050F"  # mdi-thermometer U+F050F
+  mdi_cash: "\U000F0114"  # mdi-cash U+F0114

@@ -1,0 +1,110 @@
+# Fonts used by both display pages (display_page_detail.yaml,
+# display_page_flow.yaml). Included as the value of font: in
+# givenergy_dashboard.yaml.
+#
+# glyphs: restricts each font's flash-resident bitmap set to only the
+# characters that font's it.printf calls can actually produce, working
+# through every format string per font and excluding the %X specifiers
+# themselves (those get consumed/replaced, never rendered literally).
+# Saves flash, not RAM. If a character renders blank, a glyph is missing
+# here - add it to that font's string.
+# bpp: 2 gives 4-level anti-aliasing, which is what makes these legible at
+# 10-16px. It does not fit alongside color_depth: 8bit (see display:).
+- file: "gfonts://Inter"
+  id: font_10
+  bpp: 2
+  size: 10
+  glyphs: " ()-./0123456789ABCEGIORSTWacdefghiklnoprstvy"
+- file: "gfonts://Inter"
+  id: font_14
+  bpp: 2
+  size: 14
+  # U is for page_ota's "Updating..." (givenergy_dashboard.yaml, ota:
+  # on_begin:); ° is for the Flow page header's temp readout ("42°C") -
+  # everything else it needs is already in this set. The status strip's
+  # clock is font_14_bold below, not this one, so no ':' here.
+  glyphs: " %.0123456789BCGHSUWacdeghiklnoprstuy°"
+# Bold, just for the status strip's clock ("14:32") - its own font (this
+# font component has no per-call style flag), picked over bolding the
+# whole strip after comparing both via the harness. Minimal glyph set:
+# time is the only thing that ever renders in it.
+- file: "gfonts://Inter@bold"
+  id: font_14_bold
+  bpp: 2
+  size: 14
+  glyphs: "0123456789:"
+# Also carries the Flow page's bar labels ("%.0f"), bar totals (fmt_power,
+# hence k and W) and hub SoC (hence %).
+- file: "gfonts://Inter"
+  id: font_16
+  bpp: 2
+  size: 16
+  # £ is for the Spend page's money totals (fmt_gbp, dashboard_view.h).
+  glyphs: "-.0123456789%kW£"
+- file: "gfonts://Inter"
+  id: font_20
+  bpp: 2
+  size: 20
+  glyphs: " %,0123456789W↑↓←→PolingDsabed"
+# Bold, for the Spend page's net-total figure so it stands out from the
+# import/export/live-rate figures around it. Its own font (not font_20
+# plus a style flag - this font component has none) with a minimal glyph
+# set, since fmt_gbp is the only thing that ever renders in it. Size
+# picked by comparing 20/22/24pt renders side by side - even the unlikely
+# "-£99.99" worst case clears the left column comfortably at 24pt.
+- file: "gfonts://Inter@bold"
+  id: font_24_bold
+  bpp: 2
+  size: 24
+  glyphs: "0123456789£.-"
+
+# --- Flow page fonts.
+# Mono digits for the quadrant values. Fixed advance matters here: a
+# proportional face makes the number block twitch as values cross 99/100,
+# and the mirrored layout puts two of them side by side where that shows.
+- file: "gfonts://Roboto+Mono"
+  id: font_mono_20
+  size: 20
+  bpp: 2
+  glyphs: "0123456789.-"
+- file: "gfonts://Inter"
+  id: font_9
+  size: 9
+  bpp: 2
+  # Down to just the quadrant unit suffix (fmt_flow only ever writes "W" or
+  # "kW") - the header readouts that used to share this font (freshness,
+  # temp, rate) all moved to font_14.
+  glyphs: "Wk"
+
+# MDI glyph sets, one font per size. Codepoints come from mdi_substitutions
+# (see tools/mdi_codepoints.py) rather than being written inline, because
+# they shift between MDI releases - and a codepoint that moved renders the
+# WRONG icon silently rather than a blank box.
+- file: $mdi_font
+  id: icon_13
+  size: 13
+  bpp: 2
+  glyphs: ["${mdi_wifi}", "${mdi_weather_sunny}", "${mdi_power_plug}",
+           "${mdi_transmission_tower_import}",
+           "${mdi_transmission_tower_export}",
+           "${mdi_thermometer}", "${mdi_cash}"]
+- file: $mdi_font
+  id: icon_19
+  size: 19
+  bpp: 2
+  glyphs: ["${mdi_arrow_top_right}", "${mdi_arrow_bottom_right}",
+           "${mdi_arrow_top_left}", "${mdi_arrow_bottom_left}"]
+- file: $mdi_font
+  id: icon_24
+  size: 24
+  bpp: 2
+  # mdi_cash is for the Spend page's "Now" hero row.
+  glyphs: ["${mdi_weather_sunny}", "${mdi_power_plug}",
+           "${mdi_transmission_tower}", "${mdi_battery_outline}",
+           "${mdi_battery_low}", "${mdi_battery_medium}",
+           "${mdi_battery_high}", "${mdi_battery}", "${mdi_cash}"]
+- file: $mdi_font
+  id: icon_34
+  size: 34
+  bpp: 2
+  glyphs: ["${mdi_home_outline}"]

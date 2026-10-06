@@ -1,0 +1,15 @@
+# Gitignore settings for ESPHome
+# This is an example and may include too much for your use-case.
+# You can modify this file to suit your needs.
+/.esphome/
+/secrets.yaml
+__pycache__/
+
+# tools/render_preview build/run output - generated_fonts.h IS committed
+# (same reasoning as mdi_icons.h: generated, but needed to build without
+# first running a full esphome compile).
+/tools/render_preview/*.obj
+/tools/render_preview/*.exe
+/tools/render_preview/*.bmp
+/tools/render_preview/*.png
+/tools/render_preview/build_out.txt

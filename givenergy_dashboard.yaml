@@ -1,0 +1,810 @@
+substitutions:
+  # Path to the MDI webfont TTF, relative to this config.
+  mdi_font: "fonts/materialdesignicons-webfont.ttf"
+  # Entity-ID prefix for your GivTCP integration's sensors, e.g.
+  # "sensor.givaio_XXXXXXXXX" (check Developer Tools -> States in HA for
+  # the exact prefix - it's derived from your inverter's serial).
+  ha_entity_prefix: "sensor.CHANGE_ME"
+
+# Codepoints for the Flow page's MDI glyphs, as a package so its substitutions
+# merge with the ones above rather than colliding. Generate with:
+#   python3 tools/mdi_codepoints.py <path>/materialdesignicons.css mdi_substitutions.yaml mdi_icons.h
+# Regenerate whenever the MDI font is updated: codepoints move between
+# releases, and a stale one renders the WRONG icon with no warning at all.
+packages:
+  mdi_glyphs: !include mdi_substitutions.yaml
+
+# ha_history (components/ha_history/) streams and parses HA's history API
+# response one JSON record at a time instead of buffering the whole body -
+# see that component's header for why. Local, not a git/registry source,
+# since it only exists to serve this dashboard's backfill.
+external_components:
+  - source:
+      type: local
+      path: components
+
+# --- Platform / hardware -----------------------------------------------
+
+esphome:
+  name: givenergy-display
+  friendly_name: GivEnergy Display
+  # 160MHz rather than the default 80MHz. The display lambda is the heaviest
+  # thing on this chip (8 chunk passes per refresh, see display: near the
+  # end of this file), so halving the time each pass holds the CPU leaves
+  # more of it for the WiFi stack. Costs a little extra current draw and
+  # heat, which is irrelevant on a mains-powered display.
+  platformio_options:
+    board_build.f_cpu: 160000000L
+  includes:
+    - solar_history.h
+    - dashboard_view.h
+    - dashboard_draw.h
+    - mdi_icons.h
+    - dashboard_pages.h
+    - demo_data.h
+  # The backlight is ALWAYS_OFF on restore (see light: below), so boot
+  # brightness is set explicitly here instead of being restored from flash.
+  # priority: 0 runs this at the end of boot, once the output is ready.
+  on_boot:
+    priority: 0
+    then:
+      - light.turn_on:
+          id: backlight
+          brightness: 50%
+          transition_length: 1s  # fades up over 1s; use 0s for instant
+
+esp8266:
+  board: esp12e   # ESP-12F is functionally an ESP12E-class module for ESPHome purposes
+
+# Heap monitoring - logs periodically on its own, and the sensors below let
+# you graph free heap / fragmentation over time (e.g. in HA) to see whether
+# the backfill run is actually the thing driving fragmentation up, or
+# whether it's something else entirely.
+debug:
+  update_interval: 10s
+
+sensor:
+  - platform: debug
+    free:
+      name: "Heap Free"
+    fragmentation:
+      name: "Heap Fragmentation"
+    block:
+      name: "Heap Max Block"
+
+# Verified pinout for this exact board (GeekMagic SmallTV-Ultra clone / ESP12F 240x240 ST7789 clock)
+# Source: https://github.com/slavka08/esp-mini_screen (community reverse-engineered, credited to Reddit r/hardwarehacking)
+spi:
+  clk_pin: GPIO14
+  mosi_pin: GPIO13
+
+# Backlight is active LOW on GPIO5
+output:
+  - platform: esp8266_pwm
+    pin:
+      number: GPIO5
+      inverted: true
+    frequency: 1000 Hz
+    id: backlight_output
+
+light:
+  - platform: monochromatic
+    output: backlight_output
+    id: backlight
+    name: "Backlight"
+    # Boot brightness is set explicitly in esphome: on_boot: rather than
+    # restored, so it's deterministic and doesn't write state to flash.
+    restore_mode: ALWAYS_OFF
+    # Rendering 8 passes of SPI traffic to a dark panel is pure waste, so the
+    # view driver is suspended while the backlight is off. The resume hangs
+    # off turn_on here so the dependency runs one way and is visible in the
+    # config: a suspended driver means a frozen screen, and with the backlight
+    # off you would not find out until you turned it on.
+    on_turn_on:
+      - component.resume: view_interval
+    on_turn_off:
+      - component.suspend: view_interval
+
+# --- Network / time ------------------------------------------------------
+
+#improv_serial:
+captive_portal:
+wifi:
+  id: wifi_component
+  # Skips the initial scan and connects straight to the first matching
+  # network, which is noticeably faster. If that attempt fails ESPHome falls
+  # back to a full scan, so there's no dead end. It does mean associating
+  # with whichever mesh node answers first rather than the strongest one;
+  # that has not caused a problem here.
+  fast_connect: true
+  power_save_mode: NONE
+  # Some routers drop the whole network to g/b rates when an ESP associates
+  # in g mode, which is the usual argument against forcing this. Not a
+  # concern here - other 11g-only clients already sit on this network.
+  phy_mode: 11G  # mitigate Fritz.Box 802.11n mesh bugs
+  # Don't add output_power or passive_scan back without evidence. Both were
+  # tried against the WiFi instability that turned out to be the missing
+  # yield() in the display lambda (see display: near the end of this file).
+  # output_power: 8.5dB is the floor of ESPHome's 8.5-20.5dB range against a
+  # 20dB default, so it gives up most of the link margin; passive_scan only
+  # affects scans, which fast_connect skips anyway.
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+  ap:
+    ssid: "ESPSol Fallback"
+    password: !secret fallback_pass
+    ap_timeout: 45s
+
+  # polling_enabled is the single on/off for all network activity (see
+  # switch: below) - these triggers just flip it. Off on disconnect stops
+  # the ESP burning CPU on HTTP attempts that cannot succeed.
+  #
+  # Live data is fetched and waited on before backfill starts, so the screen
+  # shows real numbers immediately rather than sitting at 0 for the whole
+  # backfill run.
+  #
+  # NOTE: script.wait has had version-specific bugs where it hangs forever
+  # when called from an early-lifecycle trigger (reported against ESPHome
+  # 2025.11.0/2025.11.1 for on_boot). If backfill never starts after the
+  # live poll completes, drop the script.wait line - http_request blocks the
+  # loop anyway, so the two calls are unlikely to overlap regardless.
+  on_disconnect:
+    - switch.turn_off: polling_enabled
+  on_connect:
+    - switch.turn_on: polling_enabled
+    - script.execute: live_poll_script
+    - script.wait: live_poll_script
+    - script.execute: backfill_script
+
+api:
+  encryption:
+    key: !secret api_key
+
+# Real wall-clock time is required to construct HA's history API URLs
+# (ISO8601 timestamps) for the backfill walk in script: below. Using UTC
+# throughout avoids any DST/timezone offset complexity in the URL
+# construction.
+time:
+  - platform: sntp
+    id: sntp_time
+    # Fires on each 5-minute bucket boundary and is the ONLY caller of
+    # advance_to. Deliberately here rather than on the polling interval:
+    # buckets the clock enters must be marked as gaps whether or not the
+    # network is up, and polling is switched off during exactly the outages
+    # that need marking. Otherwise a slot would silently redisplay the
+    # reading it held 6 hours ago as if it were current.
+    #
+    # CronTrigger only fires once time is valid, so no sync guard is needed,
+    # and it tracks the last second it evaluated rather than sampling only
+    # the current one - a loop blocked by an http_request round-trip delays
+    # the fire instead of dropping it.
+    on_time:
+      - seconds: 0
+        minutes: /5
+        then:
+          - lambda: solar_history_global.advance_to(id(sntp_time).now().timestamp);
+    # Seeds the clock cursor as soon as SNTP settles. Without this the cursor
+    # stays unset until the first 5-minute boundary, and until then the
+    # history has no representable window at all, so every backfill write is
+    # rejected. advance_to self-seeds on its first valid call and marks
+    # nothing, so calling it here is safe and idempotent.
+    #
+    # This trigger rather than only on_time because CronTrigger deliberately
+    # skips a fire when time jumps forward by more than its drift threshold -
+    # which is exactly the first sync after boot.
+    on_time_sync:
+      then:
+        - lambda: solar_history_global.advance_to(id(sntp_time).now().timestamp);
+
+safe_mode:
+  num_attempts: 4
+  storage: flash # we don't expect to boot often, but forcing safe mode through power cycling is handy.
+ota:
+  - platform: esphome
+    # Shows page_ota (display: below) for the duration of an update.
+    # on_error/on_abort restore whatever page was showing - the device
+    # carries on running. on_end does NOT: a successful esphome OTA
+    # reboots the device a moment later, so flipping back to the normal
+    # page first would just show it briefly before the screen goes black
+    # for the restart and comes back up on it again - flashing through
+    # three states for nothing. Staying on page_ota at 100% reads better
+    # across that reboot. page_ota is deliberately NOT one of
+    # select: display_page:'s options and has no on_value: branch of its
+    # own - it can only be reached from here, never picked by mistake.
+    #
+    # x is percent complete (0-100), per ESPHome's documented on_progress
+    # contract - confirmed against a real OTA run rather than the backend
+    # source, which computes it a few layers away from this trigger.
+    on_begin:
+      then:
+        - lambda: |-
+            id(ota_progress) = 0.0f;
+            id(disp).show_page(id(page_ota));
+        # show_page() alone does not redraw - the display only updates on
+        # an explicit component.update: (update_interval: never, see
+        # display: below), same reason select: display_page: needs this.
+        - component.update: disp
+    on_progress:
+      then:
+        # Forced redraw, throttled to whole-percent changes. view_interval's
+        # own 1s tick does NOT pick this up - the blocking OTA transfer
+        # starves ESPHome's component scheduler on this ESP8266, so
+        # view_interval simply never fires until the update finishes
+        # (confirmed on hardware: the bar sat at 0% for the whole transfer).
+        # on_progress can fire far more often than once per percent over a
+        # ~700KB image, so a static local skips the redundant 8-pass SPI
+        # redraws rather than forcing one on every single call.
+        - lambda: |-
+            id(ota_progress) = x;
+            static int last_drawn = -1;
+            int pct = (int) x;
+            if (pct != last_drawn) {
+              last_drawn = pct;
+              id(disp).update();
+            }
+    on_end:
+      then:
+        # No show_current_page here - see the comment above. Just pin the
+        # bar at 100% for the few seconds before the device reboots.
+        - lambda: |-
+            id(ota_progress) = 100.0f;
+            id(disp).update();
+    on_error:
+      then:
+        - script.execute: show_current_page
+    on_abort:
+      then:
+        - script.execute: show_current_page
+
+logger:
+  level: DEBUG
+  initial_level: INFO
+  logs:
+    wifi: DEBUG
+  baud_rate: 115200 # wireless logs can't catch anything that happens
+  # before/during WiFi connecting (crashes/reboots in that window print
+  # before the API log stream can attach). A passive serial listen (GND plus
+  # the ESP's TX into an adapter's RX, no flashing jig needed) is the only
+  # way to see that window directly.
+
+# --- Shared state ---------------------------------------------------------
+
+globals:
+  - id: solar_power
+    type: float
+    initial_value: '0'
+  - id: battery_power
+    type: float
+    initial_value: '0'
+  - id: battery_soc
+    type: float
+    initial_value: '0'
+  - id: home_load
+    type: float
+    initial_value: '0'
+  - id: grid_power
+    type: float
+    initial_value: '0'
+  # Two clocks for two questions. last_update_ms is monotonic and answers
+  # "have we heard from HA recently", which must stay answerable when NTP is
+  # down and must not lurch when a resync steps the clock. last_reading_epoch
+  # is wall-clock and answers "when did the inverter produce this value",
+  # which a view may want to render as a time of day rather than an age.
+  # 0 means the clock had not synced when the reading arrived.
+  - id: last_update_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: last_reading_epoch
+    type: uint32_t
+    initial_value: '0'
+  - id: solar_today_kwh
+    type: float
+    initial_value: '0'
+  - id: import_today_kwh
+    type: float
+    initial_value: '0'
+  - id: export_today_kwh
+    type: float
+    initial_value: '0'
+  - id: home_today_kwh
+    type: float
+    initial_value: '0'
+  - id: invertor_temp
+    type: float
+    initial_value: '0'
+  - id: current_rate
+    type: float
+    initial_value: '0'
+  - id: export_rate
+    type: float
+    initial_value: '0'
+  # Summed from GivTCP's day_cost + night_cost (its own rate-bucket split,
+  # not a general concept the view model should know about - see the
+  # Inputs::import_cost_today_gbp comment in dashboard_view.h) at the one
+  # point this file touches HA sensors, same as every other global here.
+  - id: import_cost_today
+    type: float
+    initial_value: '0'
+  # Rolling solar history for the sparkline: 72 x 5-minute buckets = 6 hours,
+  # sampled from the live solar_power value and backfilled from HA on connect.
+  # Needs no HA-side changes.
+  #
+  # All of its state lives in the SolarHistory object in solar_history.h - a
+  # plain C++ global referenced directly rather than via id(), since a raw
+  # float[72] cannot go through ESPHome's globals component (see that file).
+  # The bucket cursors, sample count and dedupe guard are members there, not
+  # globals here, so there is exactly one writer per piece of state.
+  - id: zoom_3h
+    type: bool
+    initial_value: 'false'
+  # True means "no backfill in progress or one just finished". The live poll
+  # interval is gated on this, so it must be set back to true once
+  # backfill_script's fetch_period() call returns, success or not - see
+  # backfill_script and the polling_enabled switch actions below.
+  - id: backfill_done
+    type: bool
+    initial_value: 'true'
+  # Percent complete (0-100) of an in-flight OTA update, read by page_ota
+  # (display: below). Only meaningful while that page is showing - see the
+  # ota: automations near the top of this file.
+  - id: ota_progress
+    type: float
+    initial_value: '0'
+
+# --- Backfill / live-poll services ----------------------------------------
+
+http_request:
+  verify_ssl: false
+  useragent: esphome-givenergy/1.0
+  esp8266_disable_ssl_support: false
+  # Shared by the live poll (fast, usually well under 1s) and ha_history's
+  # backfill fetch (a single request for the whole 6h window, which needs
+  # real time for HA to query its recorder DB and stream back the result).
+  # This only widens how long a genuinely dead request is waited out before
+  # giving up - it is not the typical response time for either caller.
+  timeout: 8s
+
+ha_history:
+  id: ha_history_client
+  base_url: http://homeassistant.local:8123
+  token: !secret ha_key
+  # Generous relative to http_request's own 8s: this bounds the gap between
+  # successive reads once the response has started streaming, not the whole
+  # fetch - see components/ha_history/ha_history.h.
+  timeout: 8s
+
+# ha_key is a long-lived access token from the HA profile page
+# (username, bottom left -> Long-Lived Access Tokens -> Create Token). It is
+# an account credential, so HA itself needs no configuration changes.
+#
+# ENTITY IDS: current_rate is unconfirmed - it was matched on naming pattern
+# alone, so check it in Developer Tools -> States before trusting the rate
+# readout. The rest are verified against a working GivTCP install.
+
+# --- REST-only backfill: fetches the whole 6h window from HA's
+# /api/history/period endpoint in a single request, needing no HA-side
+# configuration. ha_history (components/ha_history/) streams and parses the
+# response one JSON record at a time as it arrives rather than buffering the
+# full body, then hands back per-bucket sums/counts - see that component's
+# header for the full rationale. The bucket average matches how live
+# sampling commits a period average rather than an instant.
+#
+# This used to be 72 separate http_request.get calls, one per 5-minute
+# bucket, driven by a fast interval (each tick returning to loop() before
+# the next fired). That existed to dodge a real ESP8266 stack-overflow crash
+# in a much earlier script: repeat: count: 72 version (esphome/esphome#15647
+# shows the same mechanism on ESP32) - nested http_request + on_response +
+# lambda actions build call stack depth across iterations instead of
+# unwinding between them. A single ha_history call has no such loop to
+# overflow, so that whole stepping apparatus (backfill_interval,
+# backfill_step, backfill_anchor) is gone. The trade-off: this is now one
+# blocking call for the whole fetch+parse (typically 1-3s), during which the
+# display does not update - acceptable since backfill only runs on
+# reconnect or on demand, not continuously.
+#
+# UNVERIFIED: the exact JSON shape HA returns for this combination of query
+# flags was only spot-checked manually. If parsing breaks, check the real
+# response shape first - see ha_history.cpp's accumulate_record_.
+script:
+  - id: backfill_script
+    then:
+      - if:
+          condition:
+            # Needs a synced clock too: every bucket boundary below is
+            # derived from now(), so running before SNTP has settled would
+            # anchor the whole window to 1970.
+            lambda: 'return id(polling_enabled).state && id(sntp_time).now().is_valid();'
+          then:
+            - lambda: |-
+                time_t now = id(sntp_time).now().timestamp;
+                // Seed the clock cursor before fetching rather than relying
+                // on on_time_sync having already fired: store_bucket() below
+                // checks writes against the window this cursor defines, so
+                // an unset cursor would have every bucket rejected as out of
+                // window.
+                solar_history_global.advance_to(now);
+
+                uint32_t anchor = SolarHistory::bucket_of(now);
+                time_t start = (time_t) (anchor - (uint32_t) (SolarHistory::SLOTS - 1) * SolarHistory::BUCKET_S);
+                time_t end = (time_t) (anchor + SolarHistory::BUCKET_S);
+
+                static float bucket_sum[SolarHistory::SLOTS];
+                static int bucket_count[SolarHistory::SLOTS];
+                bool ok = id(ha_history_client).fetch_period(
+                    "${ha_entity_prefix}_pv_power", start, end, SolarHistory::BUCKET_S,
+                    bucket_sum, bucket_count, SolarHistory::SLOTS);
+
+                // A full refresh: an empty bucket (count 0) is stored as a
+                // real gap rather than left alone, same as the old per-step
+                // version did via store_bucket's samples<=0 case.
+                for (int i = 0; i < SolarHistory::SLOTS; i++) {
+                  uint32_t bucket = (uint32_t) start + (uint32_t) i * SolarHistory::BUCKET_S;
+                  float avg = bucket_count[i] > 0 ? bucket_sum[i] / bucket_count[i] : 0.0f;
+                  solar_history_global.store_bucket(bucket, avg, bucket_count[i]);
+                }
+
+                if (ok) {
+                  ESP_LOGI("backfill", "Backfill complete");
+                } else {
+                  ESP_LOGW("backfill", "Backfill complete (with errors)");
+                }
+                id(backfill_done) = true;
+
+  # A script rather than inline interval actions so wifi: on_connect: can
+  # call it once directly, before backfill starts. The interval below is
+  # gated on backfill_done, so without this the screen would sit at 0 for
+  # the whole backfill run on every reconnect.
+  - id: live_poll_script
+    then:
+      - http_request.post:
+          url: http://homeassistant.local:8123/api/template
+          request_headers:
+            Content-Type: application/json
+            Authorization: !secret ha_key
+          body: >-
+            {"template": "{{ states('${ha_entity_prefix}_pv_power') }},
+            {{ states('${ha_entity_prefix}_battery_power') }},
+            {{ states('${ha_entity_prefix}_soc') }},
+            {{ states('${ha_entity_prefix}_load_power') }},
+            {{ states('${ha_entity_prefix}_grid_power') }},
+            {{ (now() - as_datetime(states('${ha_entity_prefix}_last_updated_time'))).total_seconds() | round(1) }},
+            {{ states('${ha_entity_prefix}_pv_energy_today_kwh') }},
+            {{ states('${ha_entity_prefix}_import_energy_today_kwh') }},
+            {{ states('${ha_entity_prefix}_export_energy_today_kwh') }},
+            {{ states('${ha_entity_prefix}_load_energy_today_kwh') }},
+            {{ states('${ha_entity_prefix}_invertor_temperature') }},
+            {{ states('${ha_entity_prefix}_current_rate') }},
+            {{ states('${ha_entity_prefix}_export_rate') }},
+            {{ (states('${ha_entity_prefix}_day_cost') | float(0)) + (states('${ha_entity_prefix}_night_cost') | float(0)) }}"}
+          capture_response: true
+          on_response:
+            then:
+              - lambda: |-
+                  if (response->status_code == 200) {
+                    // Small plain-text CSV - no JSON parsing needed, just split on commas.
+                    const char *p = body.c_str();
+
+                    float vals[14] = {0};
+                    int idx = 0;
+                    while (*p && idx < 14) {
+                      // Skip whitespace/commas
+                      while (*p && (*p == ',' || *p == ' ')) p++;
+
+                      char *end;
+                      vals[idx++] = strtof(p, &end);
+                      p = end;
+                    }
+
+                    id(solar_power)                 = vals[0];
+                    id(battery_power)               = vals[1];
+                    id(battery_soc)                 = vals[2];
+                    id(home_load)                   = vals[3];
+                    id(grid_power)                  = vals[4];
+                    id(solar_today_kwh)             = vals[6];
+                    id(import_today_kwh)            = vals[7];
+                    id(export_today_kwh)            = vals[8];
+                    id(home_today_kwh)              = vals[9];
+                    id(invertor_temp)               = vals[10];
+                    id(current_rate)                = vals[11];
+                    id(export_rate)                 = vals[12];
+                    id(import_cost_today)           = vals[13];
+                    id(last_update_ms)              = millis();
+
+                    // Sample into the local sparkline history. Bucket
+                    // attribution, the weighted running average, the dedupe
+                    // guard and the clamp all live in SolarHistory - see
+                    // solar_history.h for why the live and clock cursors are
+                    // separate and why the two writers commute.
+                    //
+                    // The reading's OWN last-updated time (now - data_age) is
+                    // what gets passed, not "now": if GivTCP loses contact
+                    // with the inverter, vals[0] stays flat across many polls
+                    // while data_age keeps growing, and attributing that to
+                    // whatever bucket we happened to poll in would fabricate a
+                    // continuously-updating trace for a period where nothing
+                    // changed.
+                    ESPTime t = id(sntp_time).now();
+                    if (t.is_valid()) {
+                      time_t reading_epoch = t.timestamp - (time_t) vals[5];
+                      // Also the freshness anchor the view renders: it already
+                      // accounts for GivTCP sitting on a stale value, so no
+                      // separate data_age global is needed.
+                      id(last_reading_epoch) = (uint32_t) reading_epoch;
+                      solar_history_global.add_reading(t.timestamp, reading_epoch, vals[0]);
+                    }
+                  } else {
+                    ESP_LOGW("http", "Bad response: %d", response->status_code);
+                  }
+
+  # A UI concern, not a backfill/live-poll one - it lives in this script:
+  # block only because ESPHome allows exactly one per config. Shared by the
+  # ota: on_end/on_error/on_abort triggers above and select: display_page:'s
+  # on_value: below, all of which need "go back to whatever page the select
+  # is set to" and previously each duplicated the same two-line lambda.
+  - id: show_current_page
+    then:
+      - lambda: |-
+          std::string opt = id(display_page).current_option();
+          if (opt == "Flow") id(disp).show_page(id(page_flow));
+          else if (opt == "Spend") id(disp).show_page(id(page_spend));
+          else id(disp).show_page(id(page_detail));
+      # The display is driven, not self-updating, so without this the page
+      # would not change until the next view_interval tick.
+      - component.update: disp
+
+# --- Controls / automation -------------------------------------------------
+
+# The single on/off for all network activity. Off by default at boot and
+# switched on by wifi: on_connect:, so the ESP never spends CPU on HTTP
+# attempts that cannot succeed. "polling off" means exactly one thing
+# everywhere: nothing else toggles this switch or re-runs backfill_script.
+switch:
+  - platform: template
+    name: "Polling Enabled"
+    id: polling_enabled
+    optimistic: true
+    turn_on_action:
+      # Only (re-)run backfill if one was actually left unfinished - i.e.
+      # polling was toggled off mid-run. A completed or never-started run
+      # stays as-is; the live poll interval picks up on its own 10s cadence.
+      # backfill_script is now one blocking call rather than a resumable
+      # interval, so there is no partial state to pick back up - it just
+      # runs again from the start.
+      - if:
+          condition:
+            lambda: 'return !id(backfill_done);'
+          then:
+            - script.execute: backfill_script
+    turn_off_action:
+      # backfill_script's fetch is a single blocking call, so there is
+      # nothing to suspend mid-run - by the time this action runs, any
+      # in-flight call has already returned (successfully or via its own
+      # timeout). Clearing backfill_done here matters regardless: the live
+      # poll interval is gated on it, so leaving it false would mean
+      # re-enabling polling restores nothing until the next reconnect.
+      - lambda: id(backfill_done) = true;
+
+  # Swaps the view model's inputs for synthetic ones. Nothing else changes:
+  # polling keeps running, the real globals keep updating, and demo data is
+  # written to its own SolarHistory, so switching back shows live values on the
+  # very next frame with six hours of real history intact.
+  - platform: template
+    name: "Demo Mode"
+    id: demo_mode
+    optimistic: true
+    # Not restored: booting into demo after a power cut would silently show
+    # fabricated numbers with nothing on screen to say so.
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - component.update: disp
+    turn_off_action:
+      - component.update: disp
+
+button:
+  - platform: template
+    name: "Run Backfill"
+    on_press:
+      - script.execute: backfill_script
+  # Clears the stored BSSID that fast_connect reuses. The builtin platform
+  # handles the preference wipe and a safe reboot. Note this resets ALL
+  # stored preferences, not just WiFi - including safe_mode's boot counter.
+  # Credentials themselves come from !secret and are compiled in, so this
+  # does not un-provision the device.
+  - platform: factory_reset
+    name: "Clear Saved Wi-Fi Credentials"
+    icon: "mdi:wifi-remove"
+
+select:
+  # A template select rather than an HA input_select helper: it appears in HA
+  # as a dropdown automatically, with no helper to create and no homeassistant
+  # text_sensor round-trip. restore_value returns the panel to the chosen page
+  # after a power cut.
+  - platform: template
+    name: "Display page"
+    id: display_page
+    optimistic: true
+    restore_value: true
+    options:
+      - "Detail"
+      - "Flow"
+      - "Spend"
+    initial_option: "Flow"
+    on_value:
+      then:
+        # show_current_page (script: above) reads this select's own state
+        # rather than x, so this works the same whether the change came
+        # from the panel, HA, or the API.
+        - script.execute: show_current_page
+
+  - platform: template
+    name: "Sparkline Window"
+    id: sparkline_window
+    options:
+      - "3h"
+      - "6h"
+    initial_option: "6h"
+    optimistic: true
+    on_value:
+      then:
+        - lambda: |-
+            id(zoom_3h) = (x == "3h");
+
+interval:
+  # Drives the display. Rebuilds the shared view model, then renders it - back
+  # to back, so all 8 chunk passes of update() see one frozen model and cannot
+  # produce a torn frame.
+  #
+  # Deliberately NOT gated on polling_enabled, or on anything else. A driven
+  # display shows whatever was rendered last, forever, if its driver stops -
+  # the same failure mode as the suspended backfill interval, but silent. The
+  # polling-off case is handled inside the model as show_data(), so the driver
+  # itself always runs.
+  #
+  # 1s is set by the fastest-changing field, not the graph. The sparkline only
+  # shifts on a 5-minute boundary, but the freshness readout counts in seconds
+  # and the stale border should turn red on the second. Resist splitting this
+  # into fast and slow rebuilds: two rates means two ways for the model to be
+  # half-updated, which is the tearing problem in a different costume.
+  - id: view_interval
+    interval: 1s
+    then:
+      - lambda: |-
+          ESPTime t = id(sntp_time).now();
+          DashboardView::Inputs in;
+
+          #ifdef DEMO_DATA
+          // Demo mode is injected at exactly one point: the Inputs struct. The
+          // model, both pages and the polling path are all unaware of it.
+          if (id(demo_mode).state) {
+            DemoData::fill(in, demo_history, millis(), t.is_valid(), t.timestamp);
+            dashboard_view.rebuild(demo_history, in);
+            return;
+          }
+          #endif
+
+          in.now             = t.timestamp;
+          in.clock_valid     = t.is_valid();
+          // Local (DST-aware) breakdown - ESPTime.hour/minute, not derived
+          // from t.timestamp (that stays UTC on purpose, see the time:
+          // platform comment above) - for the status strip's clock.
+          in.hour            = t.hour;
+          in.minute          = t.minute;
+          in.now_ms          = millis();
+          in.last_fetch_ms   = id(last_update_ms);
+          in.reading_epoch   = id(last_reading_epoch);
+          in.polling         = id(polling_enabled).state;
+          in.link_connected  = id(wifi_component).is_connected();
+          in.link_ap         = id(wifi_component).is_ap_active();
+          // Classified here because wl_status_t only exists in the Arduino
+          // layer. The ORDER these are weighed is policy and lives in the
+          // model, so both pages read the same link state.
+          in.link_trying     = (WiFi.status() == WL_IDLE_STATUS ||
+                                WiFi.status() == WL_DISCONNECTED);
+          in.battery_w         = id(battery_power);
+          in.grid_w            = id(grid_power);
+          in.solar_w           = id(solar_power);
+          in.home_w            = id(home_load);
+          in.battery_soc_pct   = id(battery_soc);
+          in.solar_today_kwh   = id(solar_today_kwh);
+          in.home_today_kwh    = id(home_today_kwh);
+          in.import_today_kwh  = id(import_today_kwh);
+          in.export_today_kwh  = id(export_today_kwh);
+          in.inverter_temp_c   = id(invertor_temp);
+          in.rate_gbp_per_kwh  = id(current_rate);
+          in.export_rate_gbp_per_kwh = id(export_rate);
+          in.import_cost_today_gbp   = id(import_cost_today);
+          in.zoom_3h           = id(zoom_3h);
+          dashboard_view.rebuild(solar_history_global, in);
+      - component.update: disp
+
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(polling_enabled).state && id(backfill_done);'
+          then:
+            - if:
+                condition:
+                  lambda: |-
+                    // TIME CHECK: Fallback to network time calculation and rate limit
+                    ESPTime t = id(sntp_time).now();
+                    if (!t.is_valid()) {
+                      uint32_t current_ms = millis();
+                      return current_ms - id(last_update_ms) >= 5000; // rate limit un-synch'd requests
+                    }
+
+                    uint32_t now = (uint32_t)t.timestamp;
+                    uint32_t reading_epoch = id(last_reading_epoch);
+
+                    if (reading_epoch > now) return false; // Prevent underflow if time synced backward
+                    auto reading_age = now - reading_epoch;
+
+                    // poll again if we took an recent reading, or we're expecting a new reading.
+                    if (reading_age <= 1 || 10 < reading_age) {
+                      ESP_LOGI("poller", "Polling due to reading age %d", reading_age);
+                      return true;
+                    }
+                    return false;
+                then:
+                  - script.execute: live_poll_script
+
+# --- UI: display + fonts ---------------------------------------------------
+
+# CS is tied to GND on the PCB itself (always selected) - no cs_pin needed in
+# software. Backlight is active LOW on GPIO5 - handled via output:/light:
+# near the top of this file, not here.
+display:
+  - platform: mipi_spi
+    id: disp
+    # A full 240x240 RGB565 frame buffer is 115KB and cannot be allocated on
+    # a chip with no PSRAM, so a chunked buffer is mandatory. 12.5% is ~14KB
+    # and draws in 8 passes, leaving roughly 16KB free heap in normal
+    # operation.
+    buffer_size: 12.5%
+    # color_depth: 8bit would cover a larger region per pass, but renders
+    # fonts visibly worse. Font quality matters more here than pass count,
+    # and 16-bit fits comfortably in the heap budget above.
+    model: ST7789V
+    dc_pin: GPIO0
+    reset_pin: GPIO2
+    invert_colors: true   # fixes black rendering as white on this panel
+    dimensions:
+      width: 240
+      height: 240
+      offset_width: 0
+      offset_height: 0
+    rotation: 0
+    # Driven explicitly by view_interval (interval: above), which rebuilds
+    # the shared model and calls update() back to back. All 8 chunk passes
+    # happen inside that one update() call, so the model cannot change
+    # mid-frame and no double buffering is needed.
+    update_interval: never
+    # Each page is a real function in dashboard_pages.h rather than an inline
+    # lambda - real C++ syntax highlighting/tooling, and the two views are
+    # edited independently far more often than together anyway. They share
+    # little beyond draw_sparkline/fmt_* in dashboard_draw.h.
+    pages:
+      - id: page_detail
+        lambda: draw_page_detail(it, dashboard_view);
+      - id: page_flow
+        lambda: draw_page_flow(it, dashboard_view);
+      - id: page_spend
+        lambda: draw_page_spend(it, dashboard_view);
+      # OTA progress page - small enough to stay inline rather than earning
+      # its own function in dashboard_pages.h. Deliberately not one of
+      # select: display_page:'s options: it is only ever reached from the
+      # ota: automations above, never picked by hand.
+      - id: page_ota
+        lambda: |-
+          it.fill(Color::BLACK);
+          it.printf(120, 90, id(font_14), Color(200, 200, 200), TextAlign::CENTER, "Updating...");
+          int bar_x0 = 20, bar_x1 = 220, bar_y0 = 120, bar_y1 = 140;
+          it.rectangle(bar_x0, bar_y0, bar_x1 - bar_x0, bar_y1 - bar_y0, Color(80, 80, 80));
+          int fill_w = (int) ((bar_x1 - bar_x0 - 4) * (id(ota_progress) / 100.0f));
+          if (fill_w > 0) {
+            it.filled_rectangle(bar_x0 + 2, bar_y0 + 2, fill_w, bar_y1 - bar_y0 - 4, Color(46, 204, 113));
+          }
+          it.printf(120, 160, id(font_14), Color(150, 150, 150), TextAlign::CENTER, "%.0f%%", id(ota_progress));
+
+font: !include fonts.yaml
