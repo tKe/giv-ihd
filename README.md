@@ -1,11 +1,11 @@
 # GivEnergy display
 
-An [ESPHome](https://esphome.io/)-driven status display for a GivEnergy solar/battery inverter,
-running on a cheap ESP8266 "smart clock" board. Pulls live and
-historical data from Home Assistant (via the [GivTCP](https://github.com/britkat1980/givtcp)
-integration) and renders three pages — a flow diagram, a spend summary, and a
-detail view — with a rolling solar-output sparkline backed by a local history
-buffer.
+An [ESPHome](https://esphome.io/)-driven status display for a GivEnergy 
+solar/battery inverter, running on a cheap ESP8266 "smart clock" board. Pulls 
+live and historical data from Home Assistant (usually populated by the 
+[GivTCP](https://github.com/britkat1980/givtcp) integration) and renders three 
+pages — a flow diagram, a spend summary, and a detail view — with a rolling 
+solar-output sparkline backed by a local history buffer.
 
 ## Hardware
 
